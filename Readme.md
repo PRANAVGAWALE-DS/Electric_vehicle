@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/PRANAVGAWALE-DS/Electric_vehicle/actions/workflows/ci.yml/badge.svg)](https://github.com/PRANAVGAWALE-DS/Electric_vehicle/actions)
 [![Python](https://img.shields.io/badge/python-3.11-blue.svg)](https://python.org)
-[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://github.com/PRANAVGAWALE-DS/Electric_vehicle)
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://electricvehicle-oa89dgvf6dw52cd2kcxiqq.streamlit.app/)
 
 Production-grade analysis of Washington State's electric vehicle population — from EDA and statistical testing through XGBoost modelling, SHAP explainability, and an interactive Streamlit dashboard.
 
