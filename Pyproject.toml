@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ev_analysis"
+version = "0.1.0"
+description = "Washington State EV Population Analysis"
+requires-python = ">=3.11"
+dependencies = []  # pinned in requirements.txt
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+# Install in editable mode: pip install -e .
+# After this, `from src.features import ...` works in any subprocess
+# without sys.path manipulation in module files.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

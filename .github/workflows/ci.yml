@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    name: Lint & Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff pytest pytest-cov
+
+      - name: Lint with ruff
+        run: |
+          ruff check src/ tests/ app/
+          ruff format --check src/ tests/ app/
+
+      - name: Run unit tests with coverage
+        run: |
+          pytest tests/ \
+            --cov=src \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=80 \
+            -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@1e68e06f1dbfde0e4cefc87efeba9e4643565303  # v4.5.0
+        if: always()
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+
+  validate-notebooks:
+    name: Validate Notebooks (syntax check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install notebook validation tools
+        run: |
+          pip install nbformat
+
+      - name: Validate notebook JSON structure
+        run: |
+          python - <<'EOF'
+          import nbformat
+          from pathlib import Path
+          import sys
+
+          notebooks = list(Path("notebooks").glob("*.ipynb"))
+          errors = []
+          for nb_path in sorted(notebooks):
+              try:
+                  with open(nb_path) as f:
+                      nb = nbformat.read(f, as_version=4)
+                  nbformat.validate(nb)
+                  print(f"  ✅ {nb_path.name} — {len(nb.cells)} cells")
+              except Exception as e:
+                  errors.append(f"  ❌ {nb_path.name}: {e}")
+
+          if errors:
+              print("\nNotebook validation failures:")
+              for e in errors:
+                  print(e)
+              sys.exit(1)
+          else:
+              print(f"\nAll {len(notebooks)} notebooks validated successfully.")
+          EOF
