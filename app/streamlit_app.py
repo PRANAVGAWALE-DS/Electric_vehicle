@@ -11,6 +11,7 @@ Requirements: The CSV must be at data/raw/Electric_Vehicle_Population_Data.csv
 from __future__ import annotations
 
 import hashlib
+import sys
 import tempfile
 from pathlib import Path
 
@@ -18,8 +19,12 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 from src import visualizations as viz  # noqa: E402
-from src.features import (
+from src.features import (  # noqa: E402
     COUNTY_COL,
     EV_TYPE_COL,
     MAKE_COL,
