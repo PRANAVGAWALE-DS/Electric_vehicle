@@ -1,8 +1,8 @@
 # ⚡ Washington State EV Population Analysis
 
-[![CI](https://github.com/YOUR_USERNAME/ev_analysis/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/ev_analysis/actions)
+[![CI](https://github.com/PRANAVGAWALE-DS/Electric_vehicle/actions/workflows/ci.yml/badge.svg)](https://github.com/PRANAVGAWALE-DS/Electric_vehicle/actions)
 [![Python](https://img.shields.io/badge/python-3.11-blue.svg)](https://python.org)
-[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://YOUR_USERNAME-ev-analysis.streamlit.app)
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://github.com/PRANAVGAWALE-DS/Electric_vehicle)
 
 Production-grade analysis of Washington State's electric vehicle population — from EDA and statistical testing through XGBoost modelling, SHAP explainability, and an interactive Streamlit dashboard.
 
