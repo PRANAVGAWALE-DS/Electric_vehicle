@@ -28,7 +28,10 @@ from pathlib import Path
 from typing import Any
 
 import joblib
+import mlflow
+import mlflow.xgboost
 import numpy as np
+import optuna
 import pandas as pd
 from sklearn.metrics import (
     classification_report,
@@ -38,6 +41,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import (
     StratifiedKFold,
+    StratifiedShuffleSplit,
     cross_val_score,
     train_test_split,
 )
@@ -45,7 +49,21 @@ from xgboost import XGBClassifier, XGBRegressor
 
 from src.features import MAKE_COL, RANGE_COL, AggregateFeatureTransformer
 
+# mlflow.xgboost.autolog() inspects _estimator_type to identify model class.
+# XGBoost's sklearn API omits this, causing autolog to silently skip
+# per-iteration metric logging. Patching here fixes it globally.
+XGBClassifier._estimator_type = "classifier"
+XGBRegressor._estimator_type = "regressor"
+
+# Suppress per-trial INFO spam; WARNING still shows study-level summaries.
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
 logger = logging.getLogger(__name__)
+
+# Fraction of the training slice used for Optuna CV objective.
+# HPO generalises from a subsample — avoids 40 × 5 full-dataset fits.
+# At ~60% of a 120K-row train slice ≈ 72K rows per CV fold.
+HPO_SUBSAMPLE_FRAC: float = 0.60
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Feature lists — explicit, no "select by dtype" magic
@@ -86,86 +104,37 @@ CLASS_NAMES = ["eligible", "not_eligible", "unknown"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Model factories
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def build_cafv_classifier(
-    random_state: int = 42,
-    early_stopping_rounds: int | None = None,
-) -> XGBClassifier:
-    """
-    XGBoost multiclass classifier for CAFV eligibility.
-
-    Parameters
-    ----------
-    early_stopping_rounds :
-        Pass None for CV use (sklearn calls .fit() with no eval_set —
-        XGBoost raises ValueError if early_stopping_rounds is set without one).
-        Pass an int for the final fit, which supplies eval_set explicitly.
-    """
-    return XGBClassifier(
-        n_estimators=400,
-        max_depth=6,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        eval_metric="mlogloss",
-        early_stopping_rounds=early_stopping_rounds,
-        random_state=random_state,
-        n_jobs=-1,
-    )
-
-
-def build_range_regressor(
-    random_state: int = 42,
-    early_stopping_rounds: int | None = None,
-) -> XGBRegressor:
-    """
-    XGBoost regressor for Electric Range prediction.
-
-    Parameters
-    ----------
-    early_stopping_rounds :
-        Pass None for CV use. Pass an int for the final fit with eval_set.
-    """
-    return XGBRegressor(
-        n_estimators=500,
-        max_depth=6,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        eval_metric="rmse",
-        early_stopping_rounds=early_stopping_rounds,
-        random_state=random_state,
-        n_jobs=-1,
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Training routines
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def train_cafv_classifier(df: pd.DataFrame, random_state: int = 42) -> dict[str, Any]:
+def train_cafv_classifier(
+    df: pd.DataFrame,
+    random_state: int = 42,
+    n_trials: int = 40,
+) -> dict[str, Any]:
     """
     Train and evaluate the CAFV eligibility classifier.
 
-    Leakage controls applied here:
-      1. "Electric Range" and "median_range_by_make" are absent from
-         CAFV_BASE_FEATURES — they encode the target definition.
-      2. AggregateFeatureTransformer is fit on X_train only; the same
-         learned mapping is applied to X_test.
-      3. eval_set for early stopping uses a validation slice carved from
-         X_train — the test set never touches .fit().
+    When n_trials > 0, Optuna searches the XGBoost hyperparameter space using
+    5-fold stratified CV on a 60% subsample of the training slice (fast), then
+    retrains on the full training slice with best_params + early stopping.
+    Each trial is logged as a nested MLflow run — requires an active parent run
+    (started in the notebook with ``mlflow.start_run()``).
+
+    When n_trials == 0, defaults from build_cafv_classifier() are used with no
+    search (backward-compatible with the original implementation).
+
+    Leakage controls:
+      1. "Electric Range" and "median_range_by_make" absent from CAFV_BASE_FEATURES.
+      2. AggregateFeatureTransformer fit on X_train only.
+      3. eval_set for early stopping uses a val slice, never the test set.
+      4. HPO subsample drawn from X_tr only (val rows already excluded).
 
     Returns a dict with keys:
         model, agg_transformer, X_train, X_test, y_train, y_test,
-        cv_scores, report
+        cv_scores, report, study (None when n_trials == 0)
     """
-    # Include MAKE_COL so AggregateFeatureTransformer.transform() can look up
-    # market share per make.  It is dropped from X_train / X_test after
-    # transformation — the model never sees the raw make string.
     _cols_for_split = CAFV_BASE_FEATURES + [MAKE_COL]
     X = df[_cols_for_split].copy()
     y = df[CAFV_TARGET].copy()
@@ -176,43 +145,129 @@ def train_cafv_classifier(df: pd.DataFrame, random_state: int = 42) -> dict[str,
     )
 
     # ── Aggregate features: fit on X_train only ───────────────────────────────
-    # fit() on the train-index slice of df (which has RANGE_COL) so that
-    # median_range_by_make is computed from real range values, not the
-    # feature-only X_train frame.
     agg = AggregateFeatureTransformer()
-    agg.fit(df.loc[X_train.index])  # full df rows → has Make + Electric Range
+    agg.fit(df.loc[X_train.index])
 
-    # transform() reads Make from X_train / X_test and appends make_market_share
-    # (and median_range_by_make).  Make is then dropped; only CAFV_FEATURES
-    # (which excludes Make and range-derived columns) reach the model.
     X_train = agg.transform(X_train)[CAFV_FEATURES]
     X_test = agg.transform(X_test)[CAFV_FEATURES]
 
-    # ── Validation slice for early stopping ───────────────────────────────────
-    # Carved BEFORE CV so val rows are never seen inside any CV fold.
+    # ── Validation slice for early stopping (carved before HPO) ──────────────
     X_tr, X_val, y_tr, y_val = train_test_split(
         X_train, y_train, test_size=0.15, stratify=y_train, random_state=random_state
     )
 
-    # ── 5-fold stratified CV on X_tr only (val rows excluded) ────────────────
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
-    cv_model = build_cafv_classifier(random_state, early_stopping_rounds=None)
-    cv_scores = cross_val_score(cv_model, X_tr, y_tr, cv=cv, scoring="f1_macro", n_jobs=-1)
-    logger.info("CAFV CV F1-macro: %.4f ± %.4f", cv_scores.mean(), cv_scores.std())
+    # ── Optuna HPO ────────────────────────────────────────────────────────────
+    study: optuna.Study | None = None
 
-    # ── Final fit with early stopping on val slice (NOT the test set) ─────────
-    model = build_cafv_classifier(random_state, early_stopping_rounds=20)
-    model.fit(
-        X_tr,
-        y_tr,
-        eval_set=[(X_val, y_val)],
-        verbose=False,
+    if n_trials > 0:
+        # Subsample X_tr for fast CV inside each trial.
+        sss = StratifiedShuffleSplit(
+            n_splits=1, train_size=HPO_SUBSAMPLE_FRAC, random_state=random_state
+        )
+        hpo_idx, _ = next(sss.split(X_tr, y_tr))
+        X_hpo = X_tr.iloc[hpo_idx]
+        y_hpo = y_tr.iloc[hpo_idx]
+        logger.info(
+            "HPO subsample: %s / %s rows (%.0f%%)",
+            f"{len(X_hpo):,}",
+            f"{len(X_tr):,}",
+            100 * HPO_SUBSAMPLE_FRAC,
+        )
+
+        cv_hpo = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+
+        def _cafv_objective(trial: optuna.Trial) -> float:
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 100, 500),
+                "max_depth": trial.suggest_int("max_depth", 3, 8),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+                "gamma": trial.suggest_float("gamma", 0.0, 2.0),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 1.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 1.0, log=True),
+            }
+            clf = XGBClassifier(
+                **params,
+                eval_metric="mlogloss",
+                random_state=random_state,
+                n_jobs=1,  # sklearn owns the parallelism via cross_val_score
+            )
+            scores = cross_val_score(
+                clf,
+                X_hpo,
+                y_hpo,
+                cv=cv_hpo,
+                scoring="f1_macro",
+                n_jobs=-1,  # parallelise across 5 CV folds, not inside XGBoost
+                error_score=0.0,  # NaN folds (undefined F1 from degenerate params) → 0.0
+            )
+            score = float(scores.mean())
+
+            # Log each trial as a nested MLflow run.
+            # Requires an active parent run in the calling notebook cell.
+            with mlflow.start_run(nested=True, run_name=f"cafv-trial-{trial.number}"):
+                mlflow.log_params(params)
+                mlflow.log_metrics(
+                    {
+                        "cv_f1_macro": score,
+                        "cv_f1_macro_std": float(scores.std()),
+                    }
+                )
+
+            return score
+
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=random_state),
+            study_name="cafv-classifier-hpo",
+        )
+        study.optimize(
+            _cafv_objective,
+            n_trials=n_trials,
+            show_progress_bar=True,
+            catch=(Exception,),  # log failed trials, never abort the study
+        )
+
+        best_params = study.best_params
+        logger.info(
+            "Optuna CAFV — best CV F1-macro: %.4f  best params: %s",
+            study.best_value,
+            best_params,
+        )
+    else:
+        # Fallback defaults (no HPO)
+        best_params = dict(
+            n_estimators=400,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+        )
+
+    # ── Final fit on full X_tr with best_params + early stopping ─────────────
+    model = XGBClassifier(
+        **best_params,
+        eval_metric="mlogloss",
+        early_stopping_rounds=20,
+        random_state=random_state,
+        n_jobs=-1,
     )
+    model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
     logger.info(
         "CAFV classifier stopped at iteration %d / %d",
         model.best_iteration,
         model.n_estimators,
     )
+
+    # ── 5-fold CV on full X_tr with best params (final reported CV score) ─────
+    cv_final = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+    cv_model = XGBClassifier(
+        **best_params, eval_metric="mlogloss", random_state=random_state, n_jobs=-1
+    )
+    cv_scores = cross_val_score(cv_model, X_tr, y_tr, cv=cv_final, scoring="f1_macro", n_jobs=-1)
+    logger.info("CAFV final CV F1-macro: %.4f ± %.4f", cv_scores.mean(), cv_scores.std())
 
     # ── Test-set evaluation ───────────────────────────────────────────────────
     y_pred = model.predict(X_test)
@@ -228,23 +283,36 @@ def train_cafv_classifier(df: pd.DataFrame, random_state: int = 42) -> dict[str,
         y_test=y_test,
         cv_scores=cv_scores,
         report=report,
+        study=study,
     )
 
 
-def train_range_regressor(df: pd.DataFrame, random_state: int = 42) -> dict[str, Any]:
+def train_range_regressor(
+    df: pd.DataFrame,
+    random_state: int = 42,
+    n_trials: int = 40,
+) -> dict[str, Any]:
     """
     Train and evaluate the Electric Range regressor.
 
     Only uses records where Electric Range > 0 — zero values represent
     unverified ranges, not actual zero-range vehicles.
 
-    Leakage controls applied here:
-      - AggregateFeatureTransformer is fit on X_train (non-zero slice) only.
-        make_market_share reflects the training distribution exclusively.
-      - eval_set for early stopping uses a val slice from X_train; test set
-        never touches .fit().
+    When n_trials > 0, Optuna searches the XGBoost hyperparameter space using
+    5-fold CV on a 60% subsample of X_tr (neg-MAE objective), then retrains
+    on the full X_tr with best_params + early stopping. Each trial is logged
+    as a nested MLflow run.
 
-    Baseline: group-median of training set stratified by is_bev.
+    When n_trials == 0, defaults from build_range_regressor() are used.
+
+    Leakage controls:
+      - AggregateFeatureTransformer fit on X_train (non-zero slice) only.
+      - Baseline group-medians computed on y_train only.
+      - HPO subsample drawn from X_tr only (val rows excluded).
+
+    Returns a dict with keys:
+        model, agg_transformer, X_train, X_test, y_train, y_test,
+        y_pred, metrics, study (None when n_trials == 0)
     """
     df_nonzero = df[df[RANGE_COL] > 0].copy()
     logger.info(
@@ -252,8 +320,6 @@ def train_range_regressor(df: pd.DataFrame, random_state: int = 42) -> dict[str,
         f"{len(df_nonzero):,}",
     )
 
-    # Include MAKE_COL so AggregateFeatureTransformer.transform() can look up
-    # market share per make.  Dropped after transformation.
     _cols_for_split = RANGE_BASE_FEATURES + [MAKE_COL]
     X = df_nonzero[_cols_for_split].copy()
     y = df_nonzero[RANGE_COL].copy()
@@ -264,8 +330,6 @@ def train_range_regressor(df: pd.DataFrame, random_state: int = 42) -> dict[str,
     )
 
     # ── Aggregate features: fit on X_train (non-zero slice) only ─────────────
-    # fit() on the non-zero train rows of df so range medians are computed on
-    # real range values; Make column is present in both df_nonzero and X_train.
     agg = AggregateFeatureTransformer()
     agg.fit(df_nonzero.loc[X_train.index])
 
@@ -283,14 +347,106 @@ def train_range_regressor(df: pd.DataFrame, random_state: int = 42) -> dict[str,
         X_train, y_train, test_size=0.15, random_state=random_state
     )
 
-    # ── Final fit ─────────────────────────────────────────────────────────────
-    model = build_range_regressor(random_state, early_stopping_rounds=20)
-    model.fit(
-        X_tr,
-        y_tr,
-        eval_set=[(X_val, y_val)],
-        verbose=False,
+    # ── Optuna HPO ────────────────────────────────────────────────────────────
+    study: optuna.Study | None = None
+
+    if n_trials > 0:
+        # Subsample X_tr for fast CV inside each trial.
+        sss = StratifiedShuffleSplit(
+            n_splits=1, train_size=HPO_SUBSAMPLE_FRAC, random_state=random_state
+        )
+        # StratifiedShuffleSplit requires integer-like y — bin range into deciles.
+        y_tr_bins = pd.qcut(y_tr, q=10, labels=False, duplicates="drop")
+        hpo_idx, _ = next(sss.split(X_tr, y_tr_bins))
+        X_hpo = X_tr.iloc[hpo_idx]
+        y_hpo = y_tr.iloc[hpo_idx]
+        logger.info(
+            "HPO subsample: %s / %s rows (%.0f%%)",
+            f"{len(X_hpo):,}",
+            f"{len(X_tr):,}",
+            100 * HPO_SUBSAMPLE_FRAC,
+        )
+
+        cv_hpo = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+
+        def _range_objective(trial: optuna.Trial) -> float:
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 100, 500),
+                "max_depth": trial.suggest_int("max_depth", 3, 8),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+                "gamma": trial.suggest_float("gamma", 0.0, 2.0),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 1.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 1.0, log=True),
+            }
+            reg = XGBRegressor(
+                **params,
+                eval_metric="rmse",
+                random_state=random_state,
+                n_jobs=1,  # sklearn owns the parallelism via cross_val_score
+            )
+            # neg_mean_absolute_error: cross_val_score maximises, so higher = better.
+            scores = cross_val_score(
+                reg,
+                X_hpo,
+                y_hpo,
+                cv=cv_hpo,
+                scoring="neg_mean_absolute_error",
+                n_jobs=-1,  # parallelise across 5 CV folds, not inside XGBoost
+                error_score=0.0,  # degenerate params → 0.0 (worst neg-MAE = 0)
+            )
+            neg_mae = float(scores.mean())  # negative MAE; optimise to maximise
+
+            with mlflow.start_run(nested=True, run_name=f"range-trial-{trial.number}"):
+                mlflow.log_params(params)
+                mlflow.log_metrics(
+                    {
+                        "cv_neg_mae": neg_mae,
+                        "cv_neg_mae_std": float(scores.std()),
+                        "cv_mae": -neg_mae,
+                    }
+                )
+
+            return neg_mae
+
+        study = optuna.create_study(
+            direction="maximize",  # maximise neg-MAE = minimise MAE
+            sampler=optuna.samplers.TPESampler(seed=random_state),
+            study_name="range-regressor-hpo",
+        )
+        study.optimize(
+            _range_objective,
+            n_trials=n_trials,
+            show_progress_bar=True,
+            catch=(Exception,),  # log failed trials, never abort the study
+        )
+
+        best_params = study.best_params
+        logger.info(
+            "Optuna Range — best CV MAE: %.4f  best params: %s",
+            -study.best_value,
+            best_params,
+        )
+    else:
+        best_params = dict(
+            n_estimators=500,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+        )
+
+    # ── Final fit on full X_tr with best_params + early stopping ─────────────
+    model = XGBRegressor(
+        **best_params,
+        eval_metric="rmse",
+        early_stopping_rounds=20,
+        random_state=random_state,
+        n_jobs=-1,
     )
+    model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
     logger.info(
         "Range regressor stopped at iteration %d / %d",
         model.best_iteration,
@@ -321,6 +477,7 @@ def train_range_regressor(df: pd.DataFrame, random_state: int = 42) -> dict[str,
         y_test=y_test,
         y_pred=y_pred,
         metrics=metrics,
+        study=study,
     )
 
 

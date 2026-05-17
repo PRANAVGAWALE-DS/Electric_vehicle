@@ -52,10 +52,50 @@ DEFAULT_PATH = (
     Path(__file__).parent.parent / "data" / "raw" / "Electric_Vehicle_Population_Data.csv"
 )
 
+# WA State DOL Socrata open-data endpoint — returns full dataset as CSV.
+# No API key required for read-only access up to the row limit below.
+# Dataset ID: f6w7-q2d2  (Electric Vehicle Population Data)
+DOL_API_URL = (
+    "https://data.wa.gov/resource/f6w7-q2d2.csv"
+    "?$limit=250000"  # current snapshot is ~177K rows; 250K is safe headroom
+    "&$order=:id"  # stable ordering prevents partial-duplicate caching
+)
+
+
+@st.cache_data(show_spinner="Fetching dataset from WA State DOL…", ttl=86_400)
+def _fetch_remote() -> pd.DataFrame:
+    """Download from the WA DOL Socrata API and run the preprocessing pipeline."""
+    # import io
+    import urllib.request
+
+    with urllib.request.urlopen(DOL_API_URL, timeout=60) as resp:
+        raw_bytes = resp.read()
+
+    # Write to a temp file so full_preprocessing_pipeline (which expects a path)
+    # can read it without modification.
+    tmp = Path(tempfile.gettempdir()) / "ev_dol_remote.csv"
+    tmp.write_bytes(raw_bytes)
+    return full_preprocessing_pipeline(str(tmp))
+
 
 @st.cache_data(show_spinner="Loading & preprocessing dataset…")
 def load_data(path: str) -> pd.DataFrame:
     return full_preprocessing_pipeline(path)
+
+
+@st.cache_data(show_spinner="Loading dataset…")
+def get_dataframe(upload_hash: str | None, upload_path: str | None) -> pd.DataFrame:
+    """
+    Priority order:
+      1. User-uploaded file (upload_hash is not None)
+      2. Local CSV at DEFAULT_PATH (running locally with data present)
+      3. Remote WA DOL API fetch (HuggingFace Spaces / no local data)
+    """
+    if upload_path is not None:
+        return full_preprocessing_pipeline(upload_path)
+    if DEFAULT_PATH.exists():
+        return full_preprocessing_pipeline(str(DEFAULT_PATH))
+    return _fetch_remote()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -68,20 +108,25 @@ with st.sidebar:
 
     # Data source
     uploaded = st.file_uploader("Upload CSV (optional)", type=["csv"])
+    upload_hash: str | None = None
+    upload_path: str | None = None
+
     if uploaded is not None:
         file_bytes = uploaded.read()
-        content_hash = hashlib.md5(file_bytes).hexdigest()
-        tmp_path = Path(tempfile.gettempdir()) / f"ev_upload_{content_hash}.csv"
+        upload_hash = hashlib.md5(file_bytes).hexdigest()
+        tmp_path = Path(tempfile.gettempdir()) / f"ev_upload_{upload_hash}.csv"
         if not tmp_path.exists():
             tmp_path.write_bytes(file_bytes)
-        data_source = str(tmp_path)
-    elif DEFAULT_PATH.exists():
-        data_source = str(DEFAULT_PATH)
-    else:
-        st.error("No data found. Upload the CSV using the file uploader above.")
-        st.stop()
+        upload_path = str(tmp_path)
 
-    df_raw = load_data(data_source)
+    try:
+        df_raw = get_dataframe(upload_hash, upload_path)
+    except Exception as exc:
+        st.error(
+            f"Could not load data: {exc}\n\n"
+            "Upload the CSV via the file uploader above, or check your connection."
+        )
+        st.stop()
 
     st.divider()
     st.subheader("🔍 Filters")
@@ -161,11 +206,11 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
 with tab1:
     col_a, col_b = st.columns(2)
     with col_a:
-        st.plotly_chart(viz.plot_model_year_distribution(df), use_container_width=True)
+        st.plotly_chart(viz.plot_model_year_distribution(df), width="stretch")
     with col_b:
-        st.plotly_chart(viz.plot_ev_type_over_time(df), use_container_width=True)
+        st.plotly_chart(viz.plot_ev_type_over_time(df), width="stretch")
 
-    st.plotly_chart(viz.plot_market_share_over_time(df), use_container_width=True)
+    st.plotly_chart(viz.plot_market_share_over_time(df), width="stretch")
 
     # CAFV eligibility
     st.subheader("CAFV Eligibility Distribution")
@@ -174,9 +219,9 @@ with tab1:
         cafv_counts = (
             df["cafv_label"].value_counts().rename_axis("Status").reset_index(name="Count")
         )
-        st.dataframe(cafv_counts, use_container_width=True)
+        st.dataframe(cafv_counts, width="stretch")
     with col_d:
-        st.plotly_chart(viz.plot_cafv_sunburst(df), use_container_width=True)
+        st.plotly_chart(viz.plot_cafv_sunburst(df), width="stretch")
 
 
 # ── Tab 2: Map ────────────────────────────────────────────────────────────────
@@ -186,10 +231,10 @@ with tab2:
         "Choropleth uses Plotly's built-in US counties GeoJSON. "
         "Filters above apply — county selection overrides the map focus."
     )
-    st.plotly_chart(viz.plot_county_choropleth(df), use_container_width=True)
+    st.plotly_chart(viz.plot_county_choropleth(df), width="stretch")
 
     st.subheader("Top Cities")
-    st.plotly_chart(viz.plot_top_cities_treemap(df), use_container_width=True)
+    st.plotly_chart(viz.plot_top_cities_treemap(df), width="stretch")
 
     # County table
     wa_df = df[df[STATE_COL] == "WA"]
@@ -206,14 +251,14 @@ with tab2:
         .reset_index()
         .sort_values("registrations", ascending=False)
     )
-    st.dataframe(county_tbl, use_container_width=True)
+    st.dataframe(county_tbl, width="stretch")
 
 
 # ── Tab 3: Makes & Models ─────────────────────────────────────────────────────
 with tab3:
     col_e, col_f = st.columns(2)
     with col_e:
-        st.plotly_chart(viz.plot_top_makes(df), use_container_width=True)
+        st.plotly_chart(viz.plot_top_makes(df), width="stretch")
     with col_f:
         # Top models
         top_models = df[MODEL_COL].value_counts().head(15).reset_index()
@@ -231,7 +276,7 @@ with tab3:
         fig_models.update_layout(
             coloraxis_showscale=False, yaxis={"categoryorder": "total ascending"}
         )
-        st.plotly_chart(fig_models, use_container_width=True)
+        st.plotly_chart(fig_models, width="stretch")
 
     # Market share
     st.subheader("Market Concentration")
@@ -264,7 +309,7 @@ with tab3:
         color_continuous_scale="Blues",
         template="plotly_white",
     )
-    st.plotly_chart(fig_heat, use_container_width=True)
+    st.plotly_chart(fig_heat, width="stretch")
 
 
 # ── Tab 4: Range Analysis ─────────────────────────────────────────────────────
@@ -277,9 +322,9 @@ with tab4:
     )
     col_j, col_k = st.columns(2)
     with col_j:
-        st.plotly_chart(viz.plot_range_by_make(df), use_container_width=True)
+        st.plotly_chart(viz.plot_range_by_make(df), width="stretch")
     with col_k:
-        st.plotly_chart(viz.plot_range_progression(df), use_container_width=True)
+        st.plotly_chart(viz.plot_range_progression(df), width="stretch")
 
     # Range histogram
     df_r = df[df[RANGE_COL] > 0].copy()
@@ -297,7 +342,7 @@ with tab4:
         template="plotly_white",
     )
     fig_hist.update_layout(legend_title_text="EV Type")
-    st.plotly_chart(fig_hist, use_container_width=True)
+    st.plotly_chart(fig_hist, width="stretch")
 
 
 # ── Tab 5: Statistical Tests ──────────────────────────────────────────────────
@@ -378,7 +423,7 @@ with tab5:
     except Exception as e:
         results_out.append({"Test": "ANOVA: Range across years", "Error": str(e)})
 
-    st.dataframe(pd.DataFrame(results_out), use_container_width=True)
+    st.dataframe(pd.DataFrame(results_out), width="stretch")
 
     # Quick contingency table viewer
     st.subheader("Contingency Table Explorer")
@@ -388,4 +433,4 @@ with tab5:
         top_vals = df[col_x].value_counts().head(8).index
         sub_view = df[df[col_x].isin(top_vals)]
         ct_view = pd.crosstab(sub_view[col_x], sub_view[col_y])
-        st.dataframe(ct_view, use_container_width=True)
+        st.dataframe(ct_view, width="stretch")
