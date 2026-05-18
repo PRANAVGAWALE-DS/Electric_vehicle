@@ -9,7 +9,7 @@ Run with: pytest tests/test_models.py -v
 (requires `pip install -e .` from the project root so `src` is importable)
 """
 
-# import numpy as np
+import numpy as np
 import pandas as pd
 
 from src import models
@@ -179,3 +179,52 @@ def test_save_and_load_model_round_trip(tmp_path):
 
     assert path == tmp_path / "example.joblib"
     assert loaded == model
+
+
+def test_save_transformer_round_trip(tmp_path):
+    transformer = {"kind": "aggregate-transformer", "version": 1}
+
+    path = models.save_transformer(transformer, tmp_path, "cafv")
+    loaded = models.load_model(path)
+
+    assert path == tmp_path / "cafv_agg_transformer.joblib"
+    assert loaded == transformer
+
+
+def test_predict_cafv_applies_transformer_and_model_features():
+    class DummyAgg:
+        def __init__(self):
+            self.seen_columns = None
+
+        def transform(self, X):
+            self.seen_columns = list(X.columns)
+            transformed = X.copy()
+            transformed["make_market_share"] = [0.8, 0.2]
+            return transformed
+
+    class DummyModel:
+        def __init__(self):
+            self.seen_columns = None
+
+        def predict(self, X):
+            self.seen_columns = list(X.columns)
+            return np.array([0, 2])
+
+    df_new = pd.DataFrame(
+        {
+            "Model Year": [2022, 2020],
+            "is_bev": [1, 0],
+            "vehicle_age": [2, 4],
+            "is_tesla": [1, 0],
+            "Make": ["TESLA", "FORD"],
+            "ignored_extra": ["left out", "left out"],
+        }
+    )
+    agg = DummyAgg()
+    model = DummyModel()
+
+    predictions = models.predict_cafv(df_new, model, agg)
+
+    assert predictions.tolist() == [0, 2]
+    assert agg.seen_columns == models.CAFV_BASE_FEATURES + [models.MAKE_COL]
+    assert model.seen_columns == models.CAFV_FEATURES
