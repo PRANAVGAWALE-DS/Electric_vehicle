@@ -12,7 +12,7 @@
 
 Production-grade ML pipeline on 177,866 Washington State EV registrations — end-to-end from raw DOL data to deployed inference API and interactive dashboard. XGBoost models tuned with 40-trial Optuna HPO, SHAP explainability, MLflow experiment tracking, FastAPI inference layer, and a 6-tab Streamlit dashboard live on HuggingFace Spaces.
 
-> **Live dashboard →** [huggingface.co/spaces/PG-AIML/wa-ev-population-dashboard](https://huggingface.co/spaces/PG-AIML/wa-ev-population-dashboard)
+> **Live dashboard ->** [Open the HuggingFace Spaces demo](https://huggingface.co/spaces/PG-AIML/wa-ev-population-dashboard)
 
 ---
 
@@ -272,7 +272,7 @@ curl -X POST http://localhost:8000/predict/cafv \
 
 ## Dashboard
 
-Live at **[huggingface.co/spaces/PG-AIML/wa-ev-population-dashboard](https://huggingface.co/spaces/PG-AIML/wa-ev-population-dashboard)**
+Live at **[Open the HuggingFace Spaces demo](https://huggingface.co/spaces/PG-AIML/wa-ev-population-dashboard)**
 
 Data fetched automatically from the WA State DOL open-data API on first load — no CSV upload required.
 
@@ -332,7 +332,7 @@ Tests use synthetic DataFrames matching the dataset schema exactly — no CSV re
 
 ### HuggingFace Spaces (live)
 
-**[huggingface.co/spaces/PG-AIML/wa-ev-population-dashboard](https://huggingface.co/spaces/PG-AIML/wa-ev-population-dashboard)**
+**[Open the HuggingFace Spaces demo](https://huggingface.co/spaces/PG-AIML/wa-ev-population-dashboard)**
 
 Data fetched from the WA DOL open-data API at startup, cached 24 hours. No CSV upload needed.
 
